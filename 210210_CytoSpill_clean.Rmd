@@ -1,0 +1,286 @@
+---
+title: "210210_CATALYST_and_Cytospill_compensation_JNS"
+output: html_notebook
+---
+
+
+# Premessa used for pre-processing, and panel editing
+quoted out after initial use
+```{r}
+#installation
+#library(devtools)
+#install_github("ParkerICI/premessa")
+```
+
+```{r}
+#In the pop up, click the ones to remove. Including bar-coding and DNA. 
+#suppressMessages(library(premessa))
+#paneleditor_GUI()
+```
+
+#### Define working directory
+```{r setup, include=FALSE}
+###This need to be set to where the FCS files are
+knitr::opts_knit$set(root.dir = '~/Dropbox/iFReC/Code/test_files/barcodes_only/')
+```
+
+#### Load required packages
+```{r warning = FALSE, message = FALSE, include=FALSE}
+# load required packages
+suppressMessages(library(readxl))
+suppressMessages(library(cowplot))
+suppressMessages(library(CATALYST))
+suppressMessages(library(diffcyt))
+suppressMessages(library(ggplot2)) 
+suppressMessages(library(flowCore))
+suppressMessages(library(reshape))
+suppressMessages(library(ggrepel))
+suppressMessages(library(premessa))
+suppressMessages(library(flowCore))
+suppressMessages(library(CytoSpill))
+```
+
+#### print package versions loaded into your work space
+```{r}
+sessionInfo()
+```
+
+#### Define the seed for the entire workflow
+```{r}
+#set.seed for the whole workflow, use my_seed from now on
+my_seed <- 1111
+set.seed(my_seed)
+```
+
+### import fcs files as a flowset
+```{r}
+fcs_files <- list.files(pattern = ".fcs$")
+fs <- read.flowSet(fcs_files, transformation = FALSE, truncate_max_range = FALSE)
+fs
+fcs_files
+```
+
+### import metadata
+```{r}
+#metadata file in working directory, needs to have sample_id, condition, other also can be put in
+md <- read_excel("Totalcell_metadata.xlsx")                                  
+md
+```
+
+### import panel data
+```{r}
+#panel information, easiest to read column names from flowset "fs" directly then use that matched with staining panel
+#Type markers used for clustering etc.
+panel <- "Totalcell_panel.xlsx"                           
+panel <- read_excel(panel)
+panel 
+```
+
+```{r}
+# spot check that all panel columns are in the flowSet object
+all(panel$fcs_colname %in% colnames(fs))  
+```
+
+### Build the SingleCellExperiment from the fcs files, metadata, and panel information
+```{r}
+#build the sce
+sce <- prepData(fs, panel, md)
+```
+
+
+### compensation with CytoSpill
+#### concatenate fcs files 
+To make a compensation matrix based on all files together
+```{r}
+concatenate_fcs_files(fcs_files, output.file = "concat/concatenated.fcs") #make a new directory called concat first. To make it easier to rerun the standard CATALYST code without problems
+```
+
+```{r}
+#Read the concatenated expression data as a flow frame
+ff<- flowCore::exprs(flowCore::read.FCS("concat/concatenated.fcs",transformation = FALSE,truncate_max_range = FALSE))
+```
+
+```{r}
+#check the format of the loaded file
+head(ff)
+```
+
+## run cytospill on your fcs file. 
+The function returns a list of results, the first element is the compensated data matrix in flowFrame format, the second one is the estimated spillover matrix and the third one is the derived cutoffs based on our method.
+```{r}
+print(Sys.time()) #used to see how long it takes to run. It prints the current time.
+#results <- SpillComp(data = ff, cols = 1:length(ff[1,]), n = length(ff[,1]), threshold = 0.1, flexrep = 5, neighbor = 1) # use all cells
+results <- SpillComp(data = ff, cols = 1:length(ff[1,]), n = 100000, threshold = 0.1, flexrep = 5, neighbor = 1) # use 100,000 cells
+print(Sys.time())
+#cols: the columns that you want to use to calculate the spillover (might not be all channels). length(ff[1,])" means all markers
+#n: how many cells for calculation. "length(ff[,1])" means all cells
+#the last three settings are not explained, and kept at default
+#The function returns a list of results, the first element is the compensated data matrix in flowFrame format, the second one is the estimated spillover matrix and the third one is the derived cutoffs based on their method.
+#there is no verbose = F function unfortunately
+```
+
+Some times from previous tests:
+100,000 cells took 11 minutes
+Another 100,000 cells took 13.5 minutes
+489,000 took 47 minutes
+
+### Add the compensation matrix to the sce in order to compensate the sample with CATALYST
+```{r}
+#add the compensation matrix to your sce
+cmpmtx = results[[2]]
+
+panel_names = as.data.frame(colnames(results[[1]]))
+colnames(cmpmtx) = panel_names$`colnames(results[[1]])`
+rownames(cmpmtx) = panel_names$`colnames(results[[1]])`
+
+metadata(sce)$spillover_matrix <- cmpmtx
+```
+
+### Export and re-import of comp.matrix (so you do not have to do the compensation again)
+```{r}
+#export compensation matrix
+write.table(as.matrix(cmpmtx),file="210128_compMatrix_barcodeExp_allCells.tsv",sep="\t")
+
+#export sce containing compensation matrix
+saveRDS(sce,"210128_compMatrix_barcodeExp_allCells.rds")
+```
+
+```{r}
+#re-load the sce
+sce = readRDS("210128_compMatrix_barcodeExp_allCells.rds")
+
+#re-define the comp.matrix from the loaded sce
+cmpmtx = metadata(sce)$spillover_matrix
+```
+
+### plot the compensation matrix
+```{r, fig.width =3.5, fig.height = 3.5}
+#As we are subverting the normal computeSpillmat, we have to add some info on which parameters to plot using plotSpillmat. Here I choose all of them
+rowData(sce)$is_bc = c(rep(TRUE, length(cmpmtx[,1])))
+
+#plot the compensation matrix
+plotSpillmat(sce) 
+```
+
+
+## compensate in CATALYST using NNLS-method; keep uncompensated data
+You can switch between uncompensated ("exprs") or compensated values ("compexprs") whenever you can define "assay".
+```{r}
+sce <- compCytof(sce, cmpmtx, method = "nnls", overwrite = FALSE)
+```
+
+```{r}
+# visualize data before & after compensation
+chs <- c("Cd114Di", "Cd116Di")
+as <- c("exprs", "compexprs")
+ps <- lapply(as, function(a) 
+    plotScatter(sce, chs, assay = a))
+plot_grid(plotlist = ps, nrow = 1)
+```
+
+```{r}
+# visualize data before & after compensation (additional plot)
+chs <- c("Pt196Di", "Pt198Di")
+as <- c("exprs", "compexprs")
+ps <- lapply(as, function(a) 
+    plotScatter(sce, chs, assay = a))
+plot_grid(plotlist = ps, nrow = 1)
+```
+
+### generate a sce where the exprs is overwritten by the compensated values
+```{r}
+#because the "cluster" function does not allow selecting the assay = compexprs
+sce_comp <- compCytof(sce, cmpmtx, method = "nnls", overwrite = TRUE)
+```
+
+## conduct unscaled (normal) clustering
+```{r}
+set.seed(my_seed)
+sce <- cluster(sce, 
+               features = "type",
+               xdim = 10,
+               ydim = 10,
+               maxK = 70,
+               verbose = FALSE, 
+               seed = my_seed)   
+set.seed(my_seed)
+```
+
+## conduct unscaled (normal) clustering on compensated data
+```{r}
+set.seed(my_seed)
+sce_comp <- cluster(sce_comp, 
+               features = "type",
+               xdim = 10,
+               ydim = 10,
+               maxK = 70,
+               verbose = FALSE, 
+               seed = my_seed)   
+set.seed(my_seed)
+```
+
+```{r, fig.height=3, fig.width = 3}
+plotAbundances(sce, k = "meta70", by = "sample_id", group_by = "condition")
+```
+
+```{r, fig.height=3, fig.width = 3}
+plotAbundances(sce_comp, k = "meta70", by = "sample_id", group_by = "condition")
+```
+
+# Dimensionality reduction (UMAP)
+The number of cells in cytometry data is typically large, and for visualization of cells in a two-dimensional space it is often sufficient to run dimension reductions on a subset of the data. 
+To make results reproducible, the random seed should be set via `set.seed` *prior* to computing reduced dimensions:
+```{r}
+set.seed(my_seed)
+sce <- runDR(sce, 
+             dr = "UMAP", 
+             cells = 30000, 
+             features = "type",
+             n_neighbors = 5) 
+set.seed(my_seed)
+```
+
+```{r}
+set.seed(my_seed)
+sce_comp <- runDR(sce_comp, 
+             dr = "UMAP", 
+             cells = 30000, 
+             features = "type",
+             n_neighbors = 5) 
+set.seed(my_seed)
+```
+
+### plot the results coloured by clustering
+```{r, fig.height=4, fig.width=6}
+plot_grid(ncol = 2,
+  plotDR(sce, dr = "UMAP", color_by = "meta70"),
+  plotDR(sce_comp, dr = "UMAP", color_by = "meta70")
+  )
+```
+
+## Highlight specific markers expression on the UMAP
+```{r, fig.height=4, fig.width=8}
+#plotting only type markers
+plotDR(sce, 
+       dr = "UMAP", 
+       color_by = type_markers(sce),
+       ncol =5,
+       scale = T # set to false if you want to display the unscaled data
+       )
+```
+
+```{r, fig.height=4, fig.width=8}
+#plotting only type markers
+plotDR(sce_comp, 
+       dr = "UMAP", 
+       color_by = type_markers(sce_comp),
+       ncol =5,
+       scale = F # set to false if you want to display the unscaled data
+       )
+```
+
+<details>
+  <summary>**Session Info**</summary>
+```{r}
+sessionInfo()
+```
