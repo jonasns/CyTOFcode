@@ -1,0 +1,541 @@
+---
+title: "230106 - Dynverse Trajectory"
+output: html_notebook
+---
+
+#### Installation
+```{r}
+#install.packages("devtools")
+#devtools::install_github("dynverse/dyno")
+
+#API rate limit exceeded
+#Dyno uses several R packages from Github and to do this it uses the GitHub API. By default, this API is limited to 60 requests. This can be easily increased by following the two steps that are recommended by devtools::install_github, namely:
+#Use usethis::browse_github_pat() to create a GitHub token
+#Use usethis::edit_r_environ() and add the environment variable with GITHUB_PAT = 'your_github_token.
+#Restart R (so that the GITHUB_PAT is read) and try to reinstall: devtools::install_github("dynverse/dyno")
+
+#usethis::browse_github_pat()
+#usethis::edit_r_environ()
+
+#also on mac: have xcode installed and command line tools (might have to download from apple developer site)
+
+#install.packages("tidyverse")
+#BiocManager::install("hdf5r") #first install hdf5 with home brew
+
+#devtools::install_github("analyxcompany/ForceAtlas2")
+```
+
+####Load required packages
+```{r}
+#Readme: https://dynverse.org/users/2-quick_start/
+library(dyno)
+library(tidyverse)
+library(hdf5r)
+library(flowCore) #Used here to import the fcs files. Other ways may also be possible
+library(cowplot)
+library(ggplot2)
+library(Matrix)
+library(readxl)
+library(scales)
+library(ForceAtlas2)
+```
+
+##Info on loaded packages (for reproducibility). 
+It should be displayed in the html by default, but it is better to copy in the output as an extra precaution
+```{r}
+sessionInfo()
+```
+
+# Selecting your seed
+```{r}
+my_seed = 1234 
+set.seed(my_seed)
+```
+
+##Preparing the data
+The first step is to prepare the data for trajectory inference using wrap_expression. It requires both the counts and normalised expression (with genes/features in columns) as some TI methods are specifically built for one or the other:
+```{r}
+fcs_files <- list.files(path = '~/Dropbox/fcs_reexport/', pattern='.fcs$', full=TRUE, ignore.case = TRUE)
+fcs_file_list = list()
+
+
+for(i in 1:length(fcs_files))
+  {
+  nam <- paste("fcs", i, sep = "_")
+  assign(nam, read.FCS(filename=fcs_files[i], transformation=FALSE))
+  fcs_file_list[[i]] = read.FCS(filename=fcs_files[i], transformation=FALSE, truncate_max_range = FALSE)
+}
+```
+
+
+```{r}
+#extract expression matrices in a loop:
+exprs_list = list()
+for(i in 1:length(fcs_file_list))
+  {
+ nam2 <- paste("exprs", i, sep = "_")
+ assign(nam2, fcs_file_list[[i]]@exprs)
+ exprs_list[[i]] = fcs_file_list[[i]]@exprs
+  }
+```
+
+```{r}
+# Make colnames human readable using information in the parameter data slot (in a loop)
+for(i in 1:length(fcs_file_list))
+{
+  markers <- gsub(pattern = ".*_", replacement = "", x = as.vector(fcs_file_list[[i]]@parameters@data$desc))
+  colnames(exprs_list[[i]])[which(!is.na(markers))] <- markers[which(!is.na(markers))]
+}
+```
+
+
+#### Set unwanted markers to ZERO (because PAGA and PAGA tree needs at least 40 to run)
+```{r}
+name_list = colnames(exprs_list[[1]])
+name_list
+```
+
+```{r}
+#list of markers to remove
+set.seed(my_seed)
+gene_remove = c("CD11b","CD33")
+
+for(i in 1:length(exprs_list))
+  {
+ for (j in 1:length(gene_remove))
+{
+ exprs_list[[i]][,gene_remove[j]] = 0.1 #PAGA throws an error if set to specific number, so must add jitter
+ exprs_list[[i]][,gene_remove[j]] = jitter(exprs_list[[i]][,gene_remove[j]], factor = 1)
+ }
+}
+```
+
+# Downsample each dataset 
+```{r}
+#check the number of cells in each dataset
+for(i in 1:length(exprs_list))
+  {
+  print(paste("dataset", i, sep = "_")) 
+  print(length(exprs_list[[i]][,1]))
+  }
+```
+
+```{r}
+
+exprs_sub_list = list()
+for(i in 1:length(exprs_list))
+  {
+  nam2 <- paste("exprs_sub", i, sep = "_")
+  set.seed(my_seed)
+  
+  if(length(exprs_list[[i]][,1]) > 3000)
+    {
+      assign(nam2, rbind(exprs_list[[i]][sample(nrow(exprs_list[[i]]), 3000),]))
+      exprs_sub_list[[i]] = rbind(exprs_list[[i]][sample(nrow(exprs_list[[i]]), 3000),])
+    }
+ else 
+   {
+     assign(nam2, exprs_list[[i]])
+     exprs_sub_list[[i]] = exprs_list[[i]]
+   }
+  }
+```
+
+
+
+```{r}
+#check the number of cells in each dataset
+for(i in 1:length(exprs_sub_list))
+  {
+  print(paste("dataset", i, sep = "_")) 
+  print(length(exprs_sub_list[[i]][,1]))
+  }
+```
+
+
+#### rename to use downsampling for the full analysis...
+```{r}
+exprs_list = exprs_sub_list
+```
+
+
+####ArcSinh transformation
+Commonly, mass cytometry ion counts will be ArcSinh transformed - this transformation will retain linearity in the low end of the count spectrum, but it resembles a log transformation in the high end. If counts are divided by a co-factor before the transformation, the range of ion counts for which linearity is retained may be adjusted. For CyTOF data, a co-factor of 5 is typically used. Transformations are done primarily for visualization purposes and co-factors are empirically determined. In some cases, adjusting co-factors slightly may improve visualizations.
+
+```{r}
+#Arcsinh transform in loop
+# Set co-factor
+cofac <- 5
+exprs_trans_list = list()
+for(i in 1:length(exprs_list))
+  {
+  nam <- paste("exprs_trans", i,sep = "_")
+  assign(nam, asinh(exprs_list[[i]]/cofac))
+  exprs_trans_list[[i]] = asinh(exprs_list[[i]]/cofac)
+}
+```
+
+### It is necessary to add actual cell IDs! Later when making heatmaps it may be a problem to use integers, so it is better to name it cell and a number.
+```{r}
+#name list
+cell_names = str_split(fcs_files, '/', simplify = TRUE)[,10]
+cell_names = gsub(".fcs","" , cell_names)
+head(cell_names)
+```
+
+```{r}
+#Adding cell IDs in a loop 
+for(i in 1:length(exprs_list))
+  {
+  namelist = sprintf("cell%d", 1:length(exprs_list[[i]][,1]))
+  namelist2 = rep(paste(cell_names[i]), length(exprs_list[[i]][,1]))
+
+  namelist3 = as.data.frame(cbind(namelist2,namelist))
+  namelist = namelist3 %>% unite("names", 1:2, remove = TRUE)
+  namelist
+  
+  rownames(exprs_list[[i]]) = namelist[,1]
+  rownames(exprs_trans_list[[i]]) = namelist[,1]
+}
+```
+
+
+```{r}
+#Merge all (subsampled) dataset to one
+exprs_all = exprs_list[[1]]
+for(i in 2:length(exprs_list)) {
+  exprs_all = rbind(exprs_all, exprs_list[[i]] )
+}
+
+exprs_trans_all = exprs_trans_list[[1]]
+for(i in 2:length(exprs_trans_list)) {
+  exprs_trans_all = rbind(exprs_trans_all, exprs_trans_list[[i]] )
+}
+```
+
+```{r}
+#The matrix used for dunwrap has to be of class dgCMatrix! If not, you get the following error:
+#Error: `%in%`(x = "dgCMatrix", table = class(x)) is not TRUE
+#In order to make a matrix of this class, use package Matrix with sparse set to TRUE
+#example from a single file:
+#Also make one for the transformed values:
+M_trans <- Matrix(exprs_trans_all, sparse = TRUE)
+rownames(M_trans) <- rownames(exprs_trans_all)
+colnames(M_trans) <- colnames(exprs_trans_all)
+```
+
+```{r}
+#Next wrap the dataset with dynwrap:
+dataset_all <- wrap_expression(
+  counts = M_trans,
+  expression = M_trans
+)
+```
+
+
+## Running the methods
+To run a method, it is currently necessary to have either docker or singularity installed. If that’s the case, running a method is a one-step-process.
+```{r}
+#test if docker has been installed. Must result in TRUE!
+#in docker you can set the RAM, CPUs, etc. to use
+dynwrap::test_docker_installation(detailed = TRUE)
+```
+
+##Selecting the best methods for a dataset
+When the data is wrapped, the most performant and scalable set of tools can be selected using a shiny app. This app will select a set of methods which are predicted to produce the most optimal output given several user-dependent factors (such as prior expectations about the topology present in the data) and dataset-dependent factors (such as the size of the dataset). This app uses the benchmarking results from dynbenchmark (doi:10.1101/276907).
+
+```{r}
+guidelines <- guidelines_shiny(dataset_all)
+methods_selected <- guidelines$methods_selected
+```
+
+After it has been run, copy the selected guidelines from above into your script (to be able to reproduce it)!
+
+```{r}
+# Reproduces the guidelines as created in the shiny app. EXAMPLE!
+answers <- dynguidelines::answer_questions(
+  multiple_disconnected = FALSE, 
+  expect_topology = TRUE, 
+  expected_topology = "bifurcation", 
+  n_cells = 3000, 
+  n_features = 2000, 
+  time = "5m", 
+  memory = "2GB", 
+  prior_information = c("start_id", "end_id", "end_n", "start_n", "leaves_n", "groups_n", "features_id", "dimred"), 
+  docker = FALSE
+)
+guidelines <- dynguidelines::guidelines(answers = answers) 
+methods_selected <- guidelines$methods_selected
+```
+
+# PAGA on downsampled total dataset
+
+### select starting cell
+```{r}
+#view the top ranked cells
+startscell = names(sort(dataset_all$expression[,"IgD"], decreasing=TRUE)[1])
+startscell
+```
+
+```{r}
+#add prior info
+#dataset_all <- add_prior_information(dataset_all, start_n = 10, groups_n = 10, end_n = 10, leaves_n =10))
+#it's taking the info and not giving an error, but the info is not being used..
+#only below seems to be used:
+dataset_all <- add_prior_information(dataset_all, 
+                                     start_id = startscell)
+```
+
+```{r}
+used_markers = name_list[- which(name_list %in% gene_remove)]
+used_markers
+```
+
+```{r}
+# PAGA tree model
+print(Sys.time())
+model_paga_all <- infer_trajectory(dataset_all, 
+                                   "paga_tree", 
+                                   n_neighbors = as.integer(15),
+                                   embedding_type = "fa", # ForceAtlas2
+                                   n_comps = length(used_markers), 
+                                   n_dcs = as.integer(15),
+                                   resolution = as.numeric(1),
+                                   seed = my_seed,
+                                   give_priors = "start_id"
+                                   )
+print(Sys.time())
+
+```
+
+### https://dynverse.org/reference/dynmethods/method/ti_paga_tree/
+some settings can be added as given below:
+n_neighbors	
+Number of neighbours for knn. Domain: U(1, 100). Default: 15. Format: integer.
+
+n_comps	
+Number of principal components. Domain: U(0, 100). Default: 50. Format: integer.
+
+n_dcs	
+Number of diffusion components for denoising graph, 0 means no denoising. Domain: U(0, 40). Default: 15. Format: integer.
+
+resolution	
+Resolution of louvain clustering, which determines the granularity of the clustering. Higher values will result in more clusters. Domain: U(0.1, 10). Default: 1. Format: numeric.
+
+embedding_type	
+Either 'umap' (scales very well, recommended for very large datasets) or 'fa' (ForceAtlas2, often a bit more intuitive for small datasets). Domain: umap, fa. Default: fa. Format: character.
+
+
+```{r}
+#calculate the pseudotime and add it
+model_paga_all = add_root(model_paga_all, root_cell_id = startscell)
+pseudotime_model_paga_all = calculate_pseudotime(model_paga_all)
+model_paga_all = add_pseudotime(model_paga_all, pseudotime = pseudotime_model_paga_all)
+```
+
+# Plotting of the model
+```{r}
+plot_pstime_paga_all =
+  plot_dimred(
+           model_paga_all,
+           color_cells = "pseudotime")
+plot_pstime_paga_all  
+```
+
+
+```{r}
+plot_dimred(
+           model_paga_all,
+           color_cells = "milestone",
+           alpha_cells = 0.8,
+           size_cells = 1)
+```
+
+```{r}
+plot_dimred(
+  model_paga_all,
+  color_cells = "feature",
+  expression_source = dataset_all$expression,
+  alpha_cells = 0.8,
+  feature_oi = "IgD",
+  size_cells = 1)
+```
+
+```{r}
+plot_dimred(
+           model_paga_all,
+           color_cells = "pseudotime",
+           alpha_cells = 0.8,
+           size_cells = 1)
+```
+
+
+```{r}
+temp = model_paga_all
+temp$cell_ids <- sub("_[^_]+$", "", temp$cell_ids)
+model_paga_all$dataset_ids = temp$cell_ids
+```
+
+```{r}
+plot_id_paga_all =
+         plot_dimred(
+           model_paga_all,
+           color_cells = "grouping",
+           grouping = model_paga_all$dataset_ids,
+           alpha_cells = 1)
+
+plot_id_paga_all2 =
+         plot_dimred(
+           model_paga_all,
+           color_cells = "grouping",
+           grouping = model_paga_all$dataset_ids,
+           alpha_cells = 0.5,
+           #size_trajectory = 0.5,
+           size_cells = 1,
+           hex_cells = F,
+           label_milestones = F#,
+           #color_trajectory = "nearest"
+           )
+plot_grid(plot_id_paga_all,plot_id_paga_all2)
+
+```
+
+
+## checking where the selected start cell is located
+
+```{r, eval = F}
+#view the top ranked cells
+startscell = names(sort(dataset_all$expression[,"IgD"], decreasing=TRUE)[1])
+startscell
+```
+
+```{r}
+all_cell = as.data.frame(model_paga_all$dimred)
+starting_cell = subset(all_cell, rownames(all_cell) == startscell)
+
+plot_id_paga_all2 + 
+geom_point(
+      data = starting_cell,
+      aes(x = comp_1, y = comp_2),
+      color = "black",
+      fill = "red",
+      cex = 4,
+      pch = 21
+    )  
+```
+
+## all marker plots
+
+```{r, fig.width=8, fig.height=6}
+length(used_markers)
+plot_grid(ncol = 6,
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[1]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[2]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[3]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[4]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[5]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[6]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[7]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[8]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[9]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[10]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[11]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[12]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[13]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[14]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[15]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[16]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[17]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[18]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[19]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[20]),
+plot_dimred(model_paga_all, color_cells = "feature", expression_source = dataset_all$expression, alpha_cells = 0.8, size_cells = 1, feature_oi = used_markers[21])
+)
+```
+
+
+### heatmaps
+```{r, fig.width=6, fig.height=3}
+#plot a single heatmap (all markers)
+plot_heatmap(
+  model_paga_all,
+  expression_source = dataset_all$expression,
+  features_oi = 100
+)
+```
+
+```{r, fig.width=6, fig.height=2}
+#plot a single heatmap (most important markers - coloured by grouping)
+plot_heatmap(
+  model_paga_all,
+  expression_source = dataset_all$expression,
+  color_cells = "grouping",
+  grouping = model_paga_all$dataset_ids
+)
+```
+
+# colour by pseudotime
+https://stackoverflow.com/questions/15006211/how-do-i-generate-a-mapping-from-numbers-to-colors-in-r
+```{r}
+map2color<-function(x,pal,limits=NULL){
+    if(is.null(limits)) limits=range(x)
+    pal[findInterval(x,seq(limits[1],limits[2],length.out=length(pal)+1), all.inside=TRUE)]
+}
+
+x = plot_pstime_paga_all$data$color 
+
+break_cells = model_paga_all$milestone_percentages[model_paga_all$milestone_percentages$percentage == 1,]
+break_cells_pst = merge(break_cells, plot_pstime_paga_all$data, by.x = 1, by.y = 1)
+break_cells_pst$viridis = map2color(break_cells_pst$pseudotime,viridisLite::viridis(14))
+break_cells_pst = break_cells_pst[!duplicated(break_cells_pst$milestone_id.x),]
+break_cells_pst = break_cells_pst[order(break_cells_pst$milestone_id.x),]
+break_cells_pst = break_cells_pst[c(1,5,6,7,8,9,10,11,12,2,3,4),] #12 milestones
+
+mstone_colors = tibble(milestone_id = model_paga_all$milestone_ids, color = break_cells_pst$viridis)
+```
+
+```{r, fig.width=6, fig.height=3}
+plot_heatmap(
+  model_paga_all,
+  expression_source = dataset_all$expression,
+  milestones = mstone_colors,
+  features_oi = used_markers,
+  label_milestones = T
+)
+```
+
+```{r}
+plot_dimred(
+           model_paga_all,
+           color_cells = "milestone",
+           milestones = mstone_colors,
+           color_milestones ="given",
+           alpha_cells = 0.8,
+           size_cells = 1)
+```
+
+## extract data of pseudotime and marker expression and plot separately
+```{r}
+pseudo_DR = merge(x = exprs_trans_all, y = model_paga_all$pseudotime, by.x = 0, by.y = 0)
+```
+
+```{r}
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+cols = gg_color_hue(8)
+
+ggplot(pseudo_DR, aes(x = y, y = HLADR)) +
+  geom_point(size = 1, alpha = 0.3, color = cols[1], shape = 21) +
+  geom_smooth(method="auto", se=TRUE, fullrange=FALSE, level=0.95, size = 0.5, color = cols[1], fill = cols[1]) +
+  geom_point(aes(x = y, y = CD27), size = 1, alpha = 0.3, color = cols[2], shape = 21) +
+  geom_smooth(aes(x = y, y = CD27), method="auto", se=TRUE, fullrange=FALSE, level=0.95, size = 0.5, color = cols[2], fill = cols[2]) +
+  geom_point(aes(x = y, y = Ki67), size = 1, alpha = 0.3, color = cols[5], shape = 21) +
+  geom_smooth(aes(x = y, y = Ki67), method="auto", se=TRUE, fullrange=FALSE, level=0.95, size = 0.5, color = cols[5], fill = cols[5]) +
+  theme_minimal(base_size = 14) +
+  ylim(0,7) + xlab("pseudotime") + ylab("expression")
+```
+
+
+There are other types of plots available in the dynverse package. Please check tutorial.
